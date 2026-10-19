@@ -1,0 +1,143 @@
+name: Sync with upstream
+
+on:
+  schedule:
+    # every 7 days (5, 12, 19, 26; not */7, see note)
+    - cron: '25 3 5,12,19,26 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# same group as the other maintenance workflow, so two never push at once
+concurrency:
+  group: repo-maintenance
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'T-T2333/mihon'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Align main with upstream
+        env:
+          UPSTREAM_REPO: mihonapp/mihon
+          UPSTREAM_BRANCH: main
+          LOCAL_BRANCH: main
+          # Fork-only files outside .github/workflows that must survive the
+          # reset. Nothing is needed here: every workflow is preserved
+          # automatically by the .github/workflows rule below.
+          PRESERVE: |
+            # (none needed)
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+          LOCAL_SHA=$(git rev-parse HEAD)
+          UPSTREAM_SHA=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+
+          echo "local    : $LOCAL_SHA"
+          echo "upstream : $UPSTREAM_SHA"
+
+          if [ "$LOCAL_SHA" = "$UPSTREAM_SHA" ]; then
+            echo "already in sync with ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}"
+            exit 0
+          fi
+
+          PRESERVED=""
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if git cat-file -e "${LOCAL_SHA}:${f}" 2>/dev/null; then
+              PRESERVED="${PRESERVED} ${f}"
+            fi
+          done <<< "$PRESERVE"
+
+          # Builds the target tree: upstream content, plus the fork-only files,
+          # plus the fork's own .github/workflows. Runs again on retry.
+          build_tree() {
+            local base="$1"
+            local kept=""
+            local f
+
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              if git cat-file -e "${base}:${f}" 2>/dev/null; then
+                kept="${kept} ${f}"
+              fi
+            done <<< "$PRESERVE"
+
+            git reset --hard "$UPSTREAM_SHA"
+
+            for f in $kept; do
+              mkdir -p "$(dirname "$f")"
+              git show "${base}:${f}" > "$f"
+            done
+
+            # GITHUB_TOKEN is never allowed to push changes under
+            # .github/workflows ("without `workflows` permission"), and no
+            # permissions: key can grant it. So the fork keeps its own copy of
+            # every workflow file, byte for byte.
+            if git ls-tree -r --name-only "$base" -- .github/workflows | grep -q .; then
+              rm -rf .github/workflows
+              git checkout "$base" -- .github/workflows
+            elif git ls-tree -r --name-only "$UPSTREAM_SHA" -- .github/workflows | grep -q .; then
+              echo "::error::upstream has .github/workflows but this fork does not; GITHUB_TOKEN cannot add them"
+              exit 1
+            fi
+
+            git add -A
+            git write-tree
+          }
+
+          # Scheduled runs are routinely delayed by minutes or hours, so this can
+          # easily land while one of the repo's own jobs is pushing. The lease
+          # makes that a safe failure rather than a lost commit; retry on top of
+          # whatever the other job left behind so a collision costs nothing.
+          EXPECTED="$LOCAL_SHA"
+          for attempt in 1 2 3; do
+            NEW_TREE=$(build_tree "$EXPECTED")
+            OLD_TREE=$(git rev-parse "${EXPECTED}^{tree}")
+
+            if [ "$NEW_TREE" = "$OLD_TREE" ]; then
+              echo "content already matches upstream, nothing to push"
+              exit 0
+            fi
+
+            git commit -q -m "chore: sync with ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} (${UPSTREAM_SHA:0:7})"
+
+            if git push --force-with-lease="refs/heads/${LOCAL_BRANCH}:${EXPECTED}" \
+                 origin "HEAD:${LOCAL_BRANCH}"; then
+              echo "pushed $(git rev-parse HEAD) (tree ${NEW_TREE:0:7}) after ${attempt} attempt(s)"
+              exit 0
+            fi
+
+            echo "push rejected on attempt ${attempt}: the branch moved under us"
+            git fetch -q origin "$LOCAL_BRANCH"
+            EXPECTED=$(git rev-parse "origin/${LOCAL_BRANCH}")
+          done
+
+          echo "::error::could not push after 3 attempts; the branch is being written by something else"
+          exit 1
+
+      - name: Note
+        if: always()
+        run: |
+          {
+            echo "### Synced with mihonapp/mihon"
+            echo ""
+            echo "\`.github/workflows/\` is intentionally left at this fork's version."
+            echo "To pull upstream workflow changes in, push them from your own"
+            echo "machine, where your token is allowed to write workflow files."
+          } >> "$GITHUB_STEP_SUMMARY"

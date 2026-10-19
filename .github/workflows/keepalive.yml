@@ -1,0 +1,45 @@
+name: Keepalive
+
+on:
+  schedule:
+    # monthly, keeps the repository above GitHub's 60-day inactivity limit
+    - cron: '23 4 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# same group as sync-upstream.yml so the two never push at once
+concurrency:
+  group: repo-maintenance
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    if: github.repository == 'T-T2333/mihon'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Pin to the branch tip, not github.sha: a queued sync may have
+          # force-pushed since this run was created, which would leave us
+          # committing onto a stale base.
+          ref: main
+
+      - name: Create empty keepalive commit
+        env:
+          LOCAL_BRANCH: main
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Empty commit: no file changes, so it can never conflict with the
+          # sync-upstream hard reset.
+          git commit --allow-empty -m "chore: keepalive at $(date -u +'%Y-%m-%d')"
+
+          # Fast-forward only: never rewrite history here.
+          git push origin "HEAD:${LOCAL_BRANCH}"
